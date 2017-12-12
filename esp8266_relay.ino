@@ -9,8 +9,7 @@ extern "C"{
 #include <ESP8266WiFi.h>
 #include <ArduinoOTA.h>
 
-#include <Adafruit_MQTT.h>
-#include <Adafruit_MQTT_Client.h>
+#include <MQTTClient.h>
 
 #define MQTT_WAIT_TIME_MS 2000
 #define MQTT_PING_INTERVAL_US 300000000
@@ -34,65 +33,54 @@ typedef union{
 } config_t;
 
 config_t * config;
-WiFiClient client;
+WiFiClient wifi;
 
-Adafruit_MQTT_Client *mqtt;
-Adafruit_MQTT_Publish *pub;
-Adafruit_MQTT_Subscribe *sub;
+MQTTClient mqtt;
 
 uint8_t switch_status = 0;
+char dev_name[8]={0};
 
 void save_config() {
   //EEPROM.getDataPtr();
   //EEPROM.commit();
 }
 
-void MQTT_callback_str(char *data, uint16_t len) {
-  Serial.print(len);
-  Serial.print("Received: ");
+void MQTT_callback(String &topic, String &data) {
+  Serial.print(topic);
+  Serial.print(": ");
   Serial.println(data);
-  if (strcmp(data, "ON")) {
+  if (data == "ON") {
     switch_status |= 0x01;
     Serial.println("Turing on");
-  } else if (strcmp(data, "OFF")) {
+  } else if (data == "OFF") {
     switch_status &= ~0x01;
     Serial.println("Turing off");
   }
 }
 
-void MQTT_setup() {
+void MQTT_connect() {
   char sub_feed[70];
   strcpy(sub_feed, config->mqtt_feed);
   strcat(sub_feed, "/set");
 
-  uint16_t port = ((uint8_t)config->mqtt_port[1] << 8) | (uint8_t)config->mqtt_port[0];
-  mqtt = new Adafruit_MQTT_Client(&client, config->mqtt_host, port,
-    config->mqtt_user, config->mqtt_pass);
-  pub = new Adafruit_MQTT_Publish(mqtt, config->mqtt_feed);
-  sub = new Adafruit_MQTT_Subscribe(mqtt, sub_feed);
-  mqtt->subscribe(sub);
+  Serial.print("\nconnecting...");
+  while (!mqtt.connect(dev_name, config->mqtt_user, config->mqtt_pass)) {
+    Serial.print(".");
+    delay(1000);
+  }
+  mqtt.subscribe(sub_feed);
   Serial.println(sub_feed);
 }
 
-int8_t MQTT_connect() {
-  int8_t ret;
+void MQTT_setup() {
+  uint16_t port = ((uint8_t)config->mqtt_port[1] << 8) | (uint8_t)config->mqtt_port[0];
+  
+  mqtt.begin(config->mqtt_host, port, wifi);
+  mqtt.onMessage(MQTT_callback);
 
-  if (!mqtt->connected()) {
-    Serial.print("Connecting to MQTT... ");
-
-    uint8_t retries = 3;
-    while ((ret = mqtt->connect()) != 0) { // connect will return 0 for connected
-      Serial.println(mqtt->connectErrorString(ret));
-      mqtt->disconnect();
-      delay(500);
-      retries--;
-      if (retries == 0) {
-        Serial.print("Failed to connect to MQTT... ");
-        return 0;
-      }
-    }
-  }
-  return 1;
+  mqtt.setOptions(60, true, 1000);
+  
+  MQTT_connect();
 }
 
 void WiFi_setup() {
@@ -145,6 +133,7 @@ void CONF_setup() {
     EEPROM.commit();
     Serial.println("EEPROM init data written.");
   }
+  sprintf(dev_name, "%06x", ESP.getChipId());
   Serial.println(config->mqtt_host);
   Serial.println(config->mqtt_feed);
 }
@@ -172,38 +161,11 @@ void OTA_setup() {
 
 void setup() {
   Serial.begin(115200);
+  pinMode(RELAY_GPIO, OUTPUT);
   CONF_setup();
   WiFi_setup();
   OTA_setup();
   MQTT_setup();
-}
-
-void MQTT_update() {
-  static uint32_t last_micros = micros();
-  uint32_t curr_micros = micros();
-  if(curr_micros - last_micros > MQTT_PING_INTERVAL_US) {
-    if(! mqtt->ping()) {
-      mqtt->disconnect();
-    }
-  }
-
-  if (MQTT_connect()) {
-    static uint8_t lineend = 0;
-    
-    Adafruit_MQTT_Subscribe *curr_sub = mqtt->readSubscription(MQTT_WAIT_TIME_MS);
-    if(curr_sub) {
-      if(curr_sub == sub) {
-        MQTT_callback_str((char *)curr_sub->lastread, curr_sub->datalen);
-      }
-      Serial.println((char*)curr_sub->lastread);
-    }
-    if(lineend ++ == 79) {
-      Serial.println(',');      
-      lineend = 0;
-    } else {
-      Serial.print(',');
-    }
-  }
 }
 
 void RELAY_update() {
@@ -216,6 +178,10 @@ void RELAY_update() {
 
 void loop() {
   ArduinoOTA.handle();
-  MQTT_update();
+  mqtt.loop();
+  delay(10);
+  if (!mqtt.connected()) {
+    MQTT_connect();
+  }
   RELAY_update();
 }
