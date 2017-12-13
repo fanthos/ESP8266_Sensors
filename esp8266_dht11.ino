@@ -5,22 +5,22 @@ extern "C"{
 
 #include <math.h>
 
-#include <Adafruit_Sensor.h>
-#include <DHT.h>
-#include <DHT_U.h>
-
 #include <EEPROM.h>
 
 #include <ESP8266WiFi.h>
 #include <ArduinoOTA.h>
 
-#include <Adafruit_MQTT.h>
-#include <Adafruit_MQTT_Client.h>
+#include <MQTTClient.h>
 
-#define DIFF_TOLERANCE    0.12f
-#define DIFF_UPDATE       0.08f
+#define MQTT_WAIT_TIME_MS 2000
+#define MQTT_PING_INTERVAL_US 300000000
+
+#include <Adafruit_Sensor.h>
+#include <DHT.h>
+#include <DHT_U.h>
+
 #define DIFF_UPDATE_TIME  300000000L
-#define DIFF_SENSOR_TIME  2500000L
+#define DIFF_SENSOR_TIME  5000000L
 
 #define DHTPIN            D4
 
@@ -48,45 +48,43 @@ typedef union{
 } config_t;
 
 config_t * config;
-// "192.168.201.2"
-// 0x5b, 0x07
-WiFiClient client;
+WiFiClient wifi;
 
-Adafruit_MQTT_Client *mqtt;
-Adafruit_MQTT_Publish *pub;
+MQTTClient mqtt;
 
+uint8_t switch_status = 0;
+char dev_name[8]={0};
 
 void save_config() {
   //EEPROM.getDataPtr();
   //EEPROM.commit();
 }
 
-void MQTT_setup() {
-  uint16_t port = ((uint8_t)config->mqtt_port[1] << 8) | (uint8_t)config->mqtt_port[0];
-  mqtt = new Adafruit_MQTT_Client(&client, config->mqtt_host, port,
-    config->mqtt_user, config->mqtt_pass);
-  pub = new Adafruit_MQTT_Publish(mqtt, config->mqtt_feed);
+void MQTT_connect() {
+  // char sub_feed[70];
+  // strcpy(sub_feed, config->mqtt_feed);
+  // strcat(sub_feed, "/set");
+
+  int max_retry = 10;
+
+  Serial.print("\nconnecting...");
+  while (!mqtt.connect(dev_name, config->mqtt_user, config->mqtt_pass) && max_retry--) {
+    Serial.print(".");
+    delay(1000);
+  }
+  // mqtt.subscribe(sub_feed);
+  // Serial.println(sub_feed);
 }
 
-int8_t MQTT_connect() {
-  int8_t ret;
+void MQTT_setup() {
+  uint16_t port = ((uint8_t)config->mqtt_port[1] << 8) | (uint8_t)config->mqtt_port[0];
+  
+  mqtt.begin(config->mqtt_host, port, wifi);
+  // mqtt.onMessage(MQTT_callback);
 
-  if (!mqtt->connected()) {
-    Serial.print("Connecting to MQTT... ");
-
-    uint8_t retries = 3;
-    while ((ret = mqtt->connect()) != 0) { // connect will return 0 for connected
-      Serial.println(mqtt->connectErrorString(ret));
-      mqtt->disconnect();
-      delay(500);
-      retries--;
-      if (retries == 0) {
-        Serial.print("Failed to connect to MQTT... ");
-        return 0;
-      }
-    }
-  }
-  return 1;
+  mqtt.setOptions(60, true, 1000);
+  
+  MQTT_connect();
 }
 
 void WiFi_setup() {
@@ -121,6 +119,7 @@ void WiFi_setup() {
 
   Serial.print("WiFi: ");
   Serial.println(WiFi.SSID());
+  Serial.println(WiFi.localIP());
 }
 
 void CONF_setup() {
@@ -131,12 +130,15 @@ void CONF_setup() {
     strcpy(config->mqtt_host, "192.168.201.2");
     strcpy(config->mqtt_user, "hass1");
     strcpy(config->mqtt_pass, "hasstest");
-    sprintf(config->mqtt_feed, "home/switch/esp_%06x", ESP.getChipId());
+    sprintf(config->mqtt_feed, "home/smart/esp_%06x", ESP.getChipId());
     config->mqtt_port[0] = 0x5b;
     config->mqtt_port[1] = 0x07;
     EEPROM.commit();
     Serial.println("EEPROM init data written.");
   }
+  sprintf(dev_name, "%06x", ESP.getChipId());
+  Serial.println(config->mqtt_host);
+  Serial.println(config->mqtt_feed);
 }
 
 void OTA_setup() {
@@ -160,16 +162,29 @@ void OTA_setup() {
   ArduinoOTA.begin();
 }
 
-void MQTT_publish(Adafruit_MQTT_Publish *pub, int value) {
-
+int16_t DHT_read() {
+  sensors_event_t event;
+  float temp;
+  dht.temperature().getEvent(&event);
+  temp = event.temperature * 10;
+  if (isnan(temp)) {
+    return -99;
+  } else if (temp >= 0) {
+    return (int16_t)(temp + 0.5);
+  } else {
+    return (int16_t)(temp - 0.5);
+  }
 }
 
 void DHT_update() {
-  static float last_temp = -99;
-  static float last_temp_calc = -99;
+  static int16_t last_temp = -99;
+  static int16_t last_temp_update = -99;
   static uint32_t last_pub_micros = 0;
   static uint32_t last_micros = 0;
-  float temp;
+  static uint8_t sync_counter = 0;
+  int16_t itemp;
+  char print_buf[10];
+
 
   uint32_t curr_micros = micros();
   if(curr_micros - last_micros < DIFF_SENSOR_TIME) {
@@ -177,29 +192,43 @@ void DHT_update() {
   }
   last_micros = curr_micros;
 
-  sensors_event_t event;
-  dht.temperature().getEvent(&event);
-  temp = event.temperature;
-  if (!isnan(temp)) {
+  itemp = DHT_read();
+  if (itemp > -50) {
     Serial.print("Temp: ");
-    Serial.println(temp);
-    if (fabsf(last_temp - temp) > DIFF_TOLERANCE) {
-      last_temp = temp;
+    Serial.println(itemp);
+    if (itemp != last_temp) {
+      last_temp = itemp;
+      sync_counter = 0;
     } else {
-      float temp_calc = (last_temp + temp) * 0.5;
-      if (fabsf(temp_calc - last_temp_calc) > DIFF_UPDATE
-      || curr_micros - last_pub_micros > DIFF_UPDATE_TIME) {
-        if (MQTT_connect()) {
-          Serial.print("Pub: ");
-          Serial.print(last_temp_calc);
-          Serial.print(" -> ");
-          Serial.println(temp_calc);
-          pub->publish(temp_calc);
-          last_temp_calc = temp_calc;
-          last_pub_micros = curr_micros;
+      if (sync_counter >= 2) {
+        if (!mqtt.connected()) {
+          MQTT_connect();
         }
+        if (!mqtt.connected()) {
+          return;
+        }
+        if (sync_counter == 3) {
+          if (curr_micros - last_pub_micros < DIFF_UPDATE_TIME) {
+            return;
+          }
+        }
+        sync_counter = 3;
+
+        sprintf(print_buf, "%d.%d", itemp/10, itemp%10);
+
+        Serial.print("Pub: ");
+        Serial.print(last_temp_update);
+        Serial.print(" -> ");
+        Serial.println(print_buf);
+        mqtt.publish(config->mqtt_feed, print_buf, true, 0);
+        last_temp_update = itemp;
+        last_pub_micros = curr_micros;
+      } else {
+        sync_counter ++;
       }
     }
+  } else {
+    Serial.println("Temp: Fail");
   }
 }
 
@@ -216,4 +245,9 @@ void setup() {
 void loop() {
   ArduinoOTA.handle();
   DHT_update();
+  mqtt.loop();
+  delay(10);
+  if (!mqtt.connected()) {
+    MQTT_connect();
+  }
 }
