@@ -4,6 +4,7 @@ extern "C"{
 }
 
 #include <math.h>
+#include <stdlib.h>
 
 #include <EEPROM.h>
 
@@ -20,9 +21,9 @@ extern "C"{
 #include <DHT_U.h>
 
 #define DIFF_UPDATE_TIME  300000000L
-#define DIFF_SENSOR_TIME  5000000L
+#define DIFF_SENSOR_TIME  3000000L
 
-#define DHTPIN            D4
+#define DHTPIN            2
 
 #define DHTTYPE           DHT12
 
@@ -95,11 +96,17 @@ void WiFi_setup() {
   if (wifi_station_get_config(&wifi_cfg)) {
     wifi_cfg.bssid_set = 0;
     wifi_station_set_config_current(&wifi_cfg);
+    Serial.println("Unset bssid.");
   }
 
   Serial.println(WiFi.SSID());
   if (WiFi.begin() != WL_CONNECTED) {
     WiFi.beginSmartConfig();
+    if (wifi_station_get_config(&wifi_cfg)) {
+      wifi_cfg.bssid_set = 0;
+      wifi_station_set_config_current(&wifi_cfg);
+      Serial.println("Unset bssid.");
+    }
     while(WiFi.status() != WL_CONNECTED) {
       delay(500);
       Serial.print(".");
@@ -114,6 +121,7 @@ void WiFi_setup() {
     if (wifi_station_get_config(&wifi_cfg)) {
       wifi_cfg.bssid_set = 0;
       wifi_station_set_config_current(&wifi_cfg);
+      Serial.println("Unset bssid.");
     }
   }
 
@@ -168,7 +176,7 @@ int16_t DHT_read() {
   dht.temperature().getEvent(&event);
   temp = event.temperature * 10;
   if (isnan(temp)) {
-    return -99;
+    return -999;
   } else if (temp >= 0) {
     return (int16_t)(temp + 0.5);
   } else {
@@ -176,14 +184,35 @@ int16_t DHT_read() {
   }
 }
 
+int16_t round_int(int16_t i, int16_t r) {
+  // int
+  if (i < 0) i -= r;
+  i += r >> 1;
+  return i - (i % r);
+}
+
+int16_t round_int_div(int16_t i, int16_t r) {
+  // int
+  if (i < 0) i -= r;
+  i += r >> 1;
+  return i / r;
+}
+
+#define TEMP_CALC_COUNT 16
+#define TEMP_CALC_HALF (TEMP_CALC_COUNT >> 1)
+// #define TEMP_CALC_DIFF (TEMP_CALC_COUNT + (TEMP_CALC_COUNT >> 1))
+#define TEMP_CALC_DIFF (TEMP_CALC_COUNT - (TEMP_CALC_COUNT >> 3))
+#define TEMP_CALC_UPDATE (TEMP_CALC_COUNT >> 2)
 void DHT_update() {
-  static int16_t last_temp = -99;
-  static int16_t last_temp_update = -99;
   static uint32_t last_pub_micros = 0;
   static uint32_t last_micros = 0;
-  static uint8_t sync_counter = 0;
+  static int16_t last_pub_temp = -999;
+  // static int16_t last_temp = -999;
+  static int16_t temp_result[TEMP_CALC_COUNT];
+  static uint8_t temp_index = 0;
+  static uint8_t temp_ready = 0;
   int16_t itemp;
-  char print_buf[10];
+  char print_buf[12];
 
 
   uint32_t curr_micros = micros();
@@ -193,38 +222,60 @@ void DHT_update() {
   last_micros = curr_micros;
 
   itemp = DHT_read();
-  if (itemp > -50) {
+  if (itemp > -500) {
     Serial.print("Temp: ");
-    Serial.println(itemp);
-    if (itemp != last_temp) {
-      last_temp = itemp;
-      sync_counter = 0;
-    } else {
-      if (sync_counter >= 2) {
+    Serial.print(itemp);
+    temp_result[temp_index++] = itemp;
+    if (temp_index == TEMP_CALC_COUNT) {
+      temp_index = 0;
+      temp_ready = 1;
+    }
+    if (temp_ready) {
+      // Calc temp total of COUNT
+      int16_t temp_total = 0;
+      for (int loop_i = TEMP_CALC_COUNT - 1; loop_i >= 0; loop_i--) {
+        temp_total += temp_result[loop_i];
+      }
+      int16_t last_pub_temp_xcnt = last_pub_temp * TEMP_CALC_COUNT;
+      int16_t diff_temp_pub = last_pub_temp_xcnt - temp_total;
+      bool publish = false;
+      int16_t adj_temp;
+      if (abs(diff_temp_pub) >= TEMP_CALC_DIFF) {
+        // If diff greater than number, do publish update
+        publish = true;
+      } else {
+        // If avg temp near enough to number, do publish
+        int16_t temp_point = temp_total % TEMP_CALC_COUNT;
+        if (temp_point < 0) temp_point += TEMP_CALC_COUNT;
+        Serial.print(" , ");
+        Serial.print(temp_point);
+        if (temp_point < TEMP_CALC_UPDATE ||
+            temp_point > (TEMP_CALC_COUNT - TEMP_CALC_UPDATE)) {
+          // Test near enough:
+          if (curr_micros - last_pub_micros > DIFF_UPDATE_TIME) {
+            publish = true;
+          }
+        }
+      }
+      Serial.print(" , ");
+      Serial.println(temp_total);
+      if (publish) {
+        adj_temp = round_int_div(temp_total, TEMP_CALC_COUNT);
         if (!mqtt.connected()) {
           MQTT_connect();
         }
         if (!mqtt.connected()) {
           return;
         }
-        if (sync_counter == 3) {
-          if (curr_micros - last_pub_micros < DIFF_UPDATE_TIME) {
-            return;
-          }
-        }
-        sync_counter = 3;
-
-        sprintf(print_buf, "%d.%d", itemp/10, itemp%10);
+        sprintf(print_buf, "%d.%d", adj_temp/10, adj_temp%10);
 
         Serial.print("Pub: ");
-        Serial.print(last_temp_update);
+        Serial.print(last_pub_temp);
         Serial.print(" -> ");
         Serial.println(print_buf);
         mqtt.publish(config->mqtt_feed, print_buf, true, 0);
-        last_temp_update = itemp;
+        last_pub_temp = adj_temp;
         last_pub_micros = curr_micros;
-      } else {
-        sync_counter ++;
       }
     }
   } else {
