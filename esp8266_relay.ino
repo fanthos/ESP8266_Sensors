@@ -2,6 +2,7 @@ extern "C"{
 #include <user_interface.h>
 }
 
+#include <stdlib.h>
 #include <math.h>
 
 #include <EEPROM.h>
@@ -14,9 +15,14 @@ extern "C"{
 #define MQTT_WAIT_TIME_MS 2000
 #define MQTT_PING_INTERVAL_US 300000000
 
-#define RELAY_GPIO D2
+#define DIFF_UPDATE_TIME  300000000L
+
+#define RELAY_GPIO 12
+#define BUTTON_GPIO 0
 
 #define CONFIG_SIZE 512
+
+const char *MQTT_STATUS_STR[] = {"OFF", "ON"};
 
 uint32_t delaySec;
 typedef union{
@@ -38,6 +44,9 @@ WiFiClient wifi;
 MQTTClient mqtt;
 
 uint8_t switch_status = 0;
+uint8_t mqtt_status = 0;
+bool mqtt_force = false;
+
 char dev_name[8]={0};
 
 void save_config() {
@@ -52,9 +61,11 @@ void MQTT_callback(String &topic, String &data) {
   if (data == "ON") {
     switch_status |= 0x01;
     Serial.println("Turing on");
+    mqtt_force = true;
   } else if (data == "OFF") {
     switch_status &= ~0x01;
     Serial.println("Turing off");
+    mqtt_force = true;
   }
 }
 
@@ -72,15 +83,51 @@ void MQTT_connect() {
   Serial.println(sub_feed);
 }
 
+bool MQTT_update() {
+  const char *print_buf;
+  if (mqtt_status & 0x01) {
+    print_buf = MQTT_STATUS_STR[1];
+  } else {
+    print_buf = MQTT_STATUS_STR[0];
+  }
+  return mqtt.publish(config->mqtt_feed, print_buf);
+}
+
 void MQTT_setup() {
   uint16_t port = ((uint8_t)config->mqtt_port[1] << 8) | (uint8_t)config->mqtt_port[0];
-  
+
   mqtt.begin(config->mqtt_host, port, wifi);
   mqtt.onMessage(MQTT_callback);
 
   mqtt.setOptions(60, true, 1000);
-  
+
   MQTT_connect();
+  mqtt_status = switch_status;
+  MQTT_update();
+}
+
+void MQTT_loop() {
+  static uint32_t last_micros = 0;
+  uint32_t curr_micros;
+  bool do_publish = false;
+  if (!mqtt.connected()) {
+    MQTT_connect();
+  }
+  curr_micros = micros();
+
+  if (mqtt_status != switch_status) {
+    do_publish = true;
+  }
+
+  if (curr_micros - last_micros > DIFF_UPDATE_TIME) {
+    do_publish = true;
+  }
+
+  if (do_publish || mqtt_force) {
+    mqtt_status = switch_status;
+    mqtt_force = !MQTT_update();
+    last_micros = curr_micros;
+  }
 }
 
 void WiFi_setup() {
@@ -159,6 +206,31 @@ void OTA_setup() {
   ArduinoOTA.begin();
 }
 
+void RELAY_loop() {
+  if (switch_status & 0x01) {
+    digitalWrite(RELAY_GPIO, 1);
+  } else {
+    digitalWrite(RELAY_GPIO, 0);
+  }
+}
+
+void BUTTON_setup() {
+  pinMode(BUTTON_GPIO, INPUT);
+}
+
+void BUTTON_loop() {
+  static int last_status = LOW;
+  static uint32_t last_millis = 0;
+  int curr_status = digitalRead(BUTTON_GPIO);
+  uint32_t curr_millis = millis();
+  if ((last_status == HIGH && curr_status == LOW) &&
+      curr_millis - last_millis > 200) {
+    switch_status ^= 0x01;
+    last_millis = curr_millis;
+  }
+  last_status = curr_status;
+}
+
 void setup() {
   Serial.begin(115200);
   pinMode(RELAY_GPIO, OUTPUT);
@@ -168,20 +240,11 @@ void setup() {
   MQTT_setup();
 }
 
-void RELAY_update() {
-  if (switch_status & 0x01) {
-    digitalWrite(RELAY_GPIO, 0);
-  } else {
-    digitalWrite(RELAY_GPIO, 1);
-  }
-}
-
 void loop() {
   ArduinoOTA.handle();
   mqtt.loop();
   delay(10);
-  if (!mqtt.connected()) {
-    MQTT_connect();
-  }
-  RELAY_update();
+  MQTT_loop();
+  BUTTON_loop();
+  RELAY_loop();
 }
