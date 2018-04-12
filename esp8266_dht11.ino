@@ -242,25 +242,18 @@ void DHT_update() {
       int16_t adj_temp;
       if (abs(diff_temp_pub) >= TEMP_CALC_DIFF) {
         // If diff greater than number, do publish update
+        adj_temp = round_int_div(temp_total, TEMP_CALC_COUNT);
         publish = true;
       } else {
-        // If avg temp near enough to number, do publish
-        int16_t temp_point = temp_total % TEMP_CALC_COUNT;
-        if (temp_point < 0) temp_point += TEMP_CALC_COUNT;
-        Serial.print(" , ");
-        Serial.print(temp_point);
-        if (temp_point < TEMP_CALC_UPDATE ||
-            temp_point > (TEMP_CALC_COUNT - TEMP_CALC_UPDATE)) {
-          // Test near enough:
-          if (curr_micros - last_pub_micros > DIFF_UPDATE_TIME) {
-            publish = true;
-          }
+        // Update online status for sensor
+        if (curr_micros - last_pub_micros > DIFF_UPDATE_TIME) {
+          adj_temp = last_pub_temp;
+          publish = true;
         }
       }
       Serial.print(" , ");
       Serial.println(temp_total);
       if (publish) {
-        adj_temp = round_int_div(temp_total, TEMP_CALC_COUNT);
         if (!mqtt.connected()) {
           MQTT_connect();
         }
